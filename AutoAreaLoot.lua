@@ -59,9 +59,8 @@ local state = {
     useSpeedMovement = false,
     movementStateKnown = false,
     playerMoving = false,
-    channelStateKnown = false,
     playerStateSampleElapsed = 0,
-    playerChanneling = false,
+    playerSpellcastActive = false,
     playerControlLost = false,
     stopGraceTimer = nil,
     lastStopLootRequestAt = nil,
@@ -1517,6 +1516,7 @@ end
 local function GetPlayerLootRestriction()
     if state.playerControlLost then return "player control is lost" end
     if IsPlayerDeadOrGhost() then return "player is dead or a ghost" end
+    if state.playerSpellcastActive then return "player spellcast is active" end
     if IsPlayerChanneling() then return "player is channeling" end
     if IsPlayerCasting() then return "player is casting" end
     return nil
@@ -2224,12 +2224,30 @@ end
 if IsEventAvailable("UNIT_SPELLCAST_CHANNEL_STOP") then
     eventFrame:RegisterEvent("UNIT_SPELLCAST_CHANNEL_STOP")
 end
+if IsEventAvailable("UNIT_SPELLCAST_START") then
+    eventFrame:RegisterEvent("UNIT_SPELLCAST_START")
+end
+if IsEventAvailable("UNIT_SPELLCAST_CHANNEL_START") then
+    eventFrame:RegisterEvent("UNIT_SPELLCAST_CHANNEL_START")
+end
+if IsEventAvailable("UNIT_SPELLCAST_STOP") then
+    eventFrame:RegisterEvent("UNIT_SPELLCAST_STOP")
+end
 if IsEventAvailable("UNIT_SPELLCAST_CHANNEL_INTERRUPTED") then
     eventFrame:RegisterEvent("UNIT_SPELLCAST_CHANNEL_INTERRUPTED")
 end
 if IsEventAvailable("UNIT_SPELLCAST_CHANNEL_FAILED") then
     eventFrame:RegisterEvent("UNIT_SPELLCAST_CHANNEL_FAILED")
 end
+-- The 1.12 client reports tradeskill-style casts such as bandaging through
+-- these player-only events. They close the short gap where UnitCastingInfo or
+-- UnitChannelInfo may still return nil immediately after the cast begins.
+eventFrame:RegisterEvent("SPELLCAST_START")
+eventFrame:RegisterEvent("SPELLCAST_CHANNEL_START")
+eventFrame:RegisterEvent("SPELLCAST_STOP")
+eventFrame:RegisterEvent("SPELLCAST_CHANNEL_STOP")
+eventFrame:RegisterEvent("SPELLCAST_INTERRUPTED")
+eventFrame:RegisterEvent("SPELLCAST_FAILED")
 if IsEventAvailable("PLAYER_CONTROL_LOST") then
     eventFrame:RegisterEvent("PLAYER_CONTROL_LOST")
 end
@@ -2278,9 +2296,8 @@ eventFrame:SetScript("OnEvent", function()
         state.lootWalkStartedAt = nil
         state.playerMoving = false
         state.movementStateKnown = false
-        state.channelStateKnown = false
         state.playerStateSampleElapsed = 0
-        state.playerChanneling = false
+        state.playerSpellcastActive = false
         state.playerControlLost = false
         state.stopGraceTimer = nil
         state.lastStopLootRequestAt = nil
@@ -2380,9 +2397,8 @@ eventFrame:SetScript("OnEvent", function()
         state.moneyBaseline = SafeGetMoney()
         state.playerMoving = false
         state.movementStateKnown = false
-        state.channelStateKnown = false
         state.playerStateSampleElapsed = 0
-        state.playerChanneling = false
+        state.playerSpellcastActive = false
         state.playerControlLost = false
         state.stopGraceTimer = nil
         state.lastStopLootRequestAt = nil
@@ -2439,10 +2455,32 @@ eventFrame:SetScript("OnEvent", function()
         return
     end
 
+    if event == "SPELLCAST_START" or event == "SPELLCAST_CHANNEL_START"
+        or event == "UNIT_SPELLCAST_START"
+        or event == "UNIT_SPELLCAST_CHANNEL_START" then
+        if string.sub(event, 1, 5) ~= "UNIT_" or arg1 == "player" then
+            state.playerSpellcastActive = true
+            DebugLog("Player spellcast started; automatic loot blocked")
+        end
+        return
+    end
+
+    if event == "SPELLCAST_STOP" or event == "SPELLCAST_CHANNEL_STOP"
+        or event == "SPELLCAST_INTERRUPTED" or event == "SPELLCAST_FAILED"
+        or event == "UNIT_SPELLCAST_STOP" then
+        if string.sub(event, 1, 5) ~= "UNIT_" or arg1 == "player" then
+            state.playerSpellcastActive = false
+            DebugLog("Player spellcast ended; servicing deferred loot")
+            ServicePendingLootRequest()
+        end
+        return
+    end
+
     if event == "UNIT_SPELLCAST_CHANNEL_STOP"
         or event == "UNIT_SPELLCAST_CHANNEL_INTERRUPTED"
         or event == "UNIT_SPELLCAST_CHANNEL_FAILED" then
         if arg1 == "player" then
+            state.playerSpellcastActive = false
             DebugLog("Player channel ended; servicing deferred loot")
             ServicePendingLootRequest()
         end
@@ -2458,19 +2496,6 @@ eventFrame:SetScript("OnUpdate", function()
     if state.playerStateSampleElapsed >= PLAYER_STATE_SAMPLE_INTERVAL then
         state.playerStateSampleElapsed = 0
         RecoverTimedOutLootWalk()
-        local channeling = IsPlayerChanneling()
-        if not state.channelStateKnown then
-            state.playerChanneling = channeling
-            state.channelStateKnown = true
-        elseif channeling ~= state.playerChanneling then
-            state.playerChanneling = channeling
-            if channeling then
-                DebugLog("Player channel started")
-            else
-                DebugLog("Player channel ended; servicing deferred loot")
-                ServicePendingLootRequest()
-            end
-        end
     end
 
     if not state.useSpeedMovement then return end
