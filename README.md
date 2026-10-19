@@ -22,7 +22,7 @@ AutoAreaLoot automatically loots nearby corpses when it is safe to do so.
   are not dependent on forward/back movement events
 - Uses a bounded latency-adjusted settling period after successful walks,
   avoiding rescans while loot is still being delivered
-- `/aal` opens a small settings panel with enable, death, movement-stop, and combat toggles
+- `/aal` opens a small settings panel with enable, death, movement-stop, combat, and item filter toggles
 - `/aal log` opens a compact, scrollable session loot log
 - `/aal debug` opens a bounded, copyable diagnostic trace without flooding chat
 - Confirms item loot from the player's localized loot messages and filters it against the corpse scan
@@ -40,19 +40,56 @@ AutoAreaLoot automatically loots nearby corpses when it is safe to do so.
 - Automatically uses a built-in pfUI theme when pfUI is loaded
 - Slash commands can still enable, disable, or report the addon status
 
-## API requirement
+## Item filter
 
-AutoAreaLoot requires the `C_Loot.LootAllCorpses` function provided by the ClassicAPI DLL. It checks for that function at runtime and displays a chat message if it is unavailable.
+This fork can loot only the items you choose instead of everything.
+
+- Turn it on with **Only loot items on my list** in `/aal`, or `/aal filter on`
+- Optionally also loot every item of a chosen quality or better (`/aal quality green`)
+- Choose whether money is still looted while filtering (`/aal money on|off`)
+- Items that are not wanted stay on the corpse
+- The filter menu (`/aal items`, or **Edit Filter List...** in `/aal`):
+  - drag an item from your bags onto the **+** slot to add it
+  - search by name or item ID across your bags, items that have dropped for
+    you, and the pfQuest item database
+  - scrollable result and filter lists with an **Add** / **Remove** button per item
+- ESC closes the filter menu first, then the settings panel
+
+## Requirements
+
+| Requirement | Needed for |
+| --- | --- |
+| [ClassicAPI](https://github.com/brues-code/ClassicAPI) DLL with `C_Loot.LootAllCorpses` | Normal looting (required) |
+| [ClassicAPI](https://github.com/brues-code/ClassicAPI) DLL with `C_Loot.ScanNearbyLoot`, `C_Loot.LootUnitItem` and `C_Loot.LootUnit` | The item filter (required when the filter is on) |
+| [HearthDB.dll](https://github.com/copypasteonly/HearthDB) | Reading the pfQuest-HDB item database (optional) |
+| [pfQuest-HDB](https://github.com/rivi-s/pfQuest-HDB-Install) | Searching the full item database in the filter menu (optional) |
+| Nampower | Reliable death detection (optional) |
+
+AutoAreaLoot checks for the ClassicAPI functions at runtime and prints a chat
+message if they are missing. With the filter on and the filter functions
+missing, nothing is looted until the DLL is updated or the filter is turned off.
+
+### HearthDB (optional)
+
+The [pfQuest-HDB](https://github.com/rivi-s/pfQuest-HDB-Install) edition keeps
+its item names in a SQLite database that is read through
+[HearthDB.dll](https://github.com/copypasteonly/HearthDB). With both installed,
+the filter menu search can find any item pfQuest knows, including Turtle WoW
+custom items. Without it, the search still lists items in your bags
+and items that have dropped for you, and you can always add an item by name
+with `/aal add Item Name`.
 
 Nampower is optional. When its `UNIT_DIED` event is available, the addon uses it; otherwise it falls back to `CHAT_MSG_COMBAT_HOSTILE_DEATH`.
 
 ## Installation
 
-In the launcher, choose **Add Addon from Git** and use:
+In the launcher, choose **Add Addon from Git** and use your fork's URL, for example:
 
 ```text
-https://github.com/Foulwerp/AutoAreaLoot.git
+https://github.com/<your-username>/AutoAreaLoot.git
 ```
+
+Original addon by Foulwerp: <https://github.com/Foulwerp/AutoAreaLoot>
 
 The addon should be installed as:
 
@@ -70,6 +107,15 @@ Interface/AddOns/AutoAreaLoot
 /aal debug
 /aal debug off
 /aal debug clear
+/aal items
+/aal filter on|off
+/aal add [shift-click an item, or type the name]
+/aal remove [item]
+/aal list
+/aal clear
+/aal quality off|grey|white|green|blue|purple|orange
+/aal money on|off
+/aal help
 ```
 
 Typing `/aal` without an argument opens or closes the settings panel.
