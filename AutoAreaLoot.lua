@@ -33,6 +33,10 @@ local defaults = {
     lootInCombat = true,
     lootCombine = false,
     openLootLogOnLogin = false,
+    filterEnabled = false,
+    filterMoney = true,
+    filterMinQuality = -1,
+    filterItems = {},
     lootLogWidth = 280,
     lootLogHeight = 195,
     lootLogPoint = "CENTER",
@@ -1667,6 +1671,20 @@ local function LootNearbyCorpses(source)
         DebugLog("Loot request stopped: ClassicAPI loot API unavailable")
         return false
     end
+    if AutoAreaLootDB.filterEnabled and AAL_Filter
+        and not AAL_Filter.HasAPI() then
+        DebugLog("Loot request stopped: filter needs ScanNearbyLoot/LootUnitItem/LootUnit")
+        if not state.filterApiWarned then
+            state.filterApiWarned = true
+            DEFAULT_CHAT_FRAME:AddMessage("AutoAreaLoot: the item filter needs a newer ClassicAPI DLL (C_Loot.ScanNearbyLoot and C_Loot.LootUnitItem). Nothing will be looted until you update it or turn the filter off.")
+        end
+        return false
+    end
+    if state.filterQueueActive then
+        QueuePendingLootRequest(source)
+        DebugLog("Loot request deferred: filtered loot queue is running; source=" .. source)
+        return false
+    end
 
     if state.stopGraceTimer then
         QueuePendingLootRequest(source)
@@ -1760,11 +1778,18 @@ local function LootNearbyCorpses(source)
 
     state.pendingLootReason = nil
     local capture = { events = {} }
+    capture.filtered = AutoAreaLootDB.filterEnabled and true or false
     state.activeCapture = capture
     state.lootWalkActive = true
     state.lootWalkStartedAt = type(GetTime) == "function" and GetTime() or nil
-    DebugLog("Calling C_Loot.LootAllCorpses")
-    local callOK, callResult = pcall(C_Loot.LootAllCorpses)
+    local callOK, callResult
+    if capture.filtered then
+        DebugLog("Calling C_Loot.ScanNearbyLoot (item filter is on)")
+        callOK, callResult = pcall(C_Loot.ScanNearbyLoot)
+    else
+        DebugLog("Calling C_Loot.LootAllCorpses")
+        callOK, callResult = pcall(C_Loot.LootAllCorpses)
+    end
     local started = callOK and callResult and true or false
     DebugLog("LootAllCorpses returned: callOK=" .. tostring(callOK)
         .. " result=" .. tostring(callResult)
@@ -1955,6 +1980,15 @@ CompleteActiveLootWalk = function()
                 DebugLog("Discarded redundant stop/combat follow-up after successful scan")
             end
         end
+        if capture.filtered and AAL_Filter then
+            local filterOK, filteredResults = pcall(AAL_Filter.Apply, results)
+            if filterOK and type(filteredResults) == "table" then
+                results = filteredResults
+            else
+                DebugLog("Item filter failed: " .. tostring(filteredResults))
+                results = {}
+            end
+        end
         -- Any logging failure ends here and cannot affect looting.
         local captureOK, captureError = pcall(CompleteLootCapture, capture, results)
         if not captureOK then
@@ -2029,10 +2063,1016 @@ local function RecoverTimedOutLootWalk()
     ServicePendingLootRequest()
 end
 
+-- ===== Item filter =====
+-- With the filter on, nothing is looted by LootAllCorpses. Instead the nearby
+-- corpses are scanned silently, each item is checked against the filter, and
+-- only the wanted items (and optionally money) are taken one at a time.
+AAL_Filter = {}
+
+local FILTER_STEP_DELAY = 0.30
+local FILTER_RETRY_DELAY = 0.15
+local FILTER_MAX_ATTEMPTS = 12
+local FILTER_COIN_TIMEOUT = 2.5
+local FILTER_QUEUE_TIMEOUT = 20
+local FILTER_QUALITY_BY_COLOR = {
+    ["9d9d9d"] = 0, ["ffffff"] = 1, ["1eff00"] = 2,
+    ["0070dd"] = 3, ["a335ee"] = 4, ["ff8000"] = 5,
+}
+local FILTER_QUALITY_NAMES = { [0] = "grey", "white", "green", "blue", "purple", "orange" }
+local FILTER_QUALITY_ALIASES = {
+    grey = 0, gray = 0, poor = 0,
+    white = 1, common = 1,
+    green = 2, uncommon = 2,
+    blue = 3, rare = 3,
+    purple = 4, epic = 4,
+    orange = 5, legendary = 5,
+}
+
+local function FilterNow()
+    return type(GetTime) == "function" and GetTime() or 0
+end
+
+local function FilterPrint(message)
+    DEFAULT_CHAT_FRAME:AddMessage("AutoAreaLoot: " .. message)
+end
+
+function AAL_Filter.HasAPI()
+    return C_Loot and type(C_Loot.ScanNearbyLoot) == "function"
+        and type(C_Loot.LootUnitItem) == "function"
+        and type(C_Loot.LootUnit) == "function"
+end
+
+function AAL_Filter.ParseEntry(text)
+    text = string.match(text or "", "^%s*(.-)%s*$")
+    if not text or text == "" then return nil end
+    local id = string.match(text, "item:(%d+)")
+    if id then
+        return { id = tonumber(id), name = string.match(text, "%[(.-)%]") }
+    end
+    if string.find(text, "^%d+$") then
+        return { id = tonumber(text) }
+    end
+    return { name = text }
+end
+
+function AAL_Filter.EntryLabel(entry)
+    if entry.name then return entry.name end
+    return "item:" .. tostring(entry.id)
+end
+
+local function EntriesMatch(a, b)
+    if a.id and b.id then return a.id == b.id end
+    if a.name and b.name then
+        return string.lower(a.name) == string.lower(b.name)
+    end
+    return false
+end
+
+function AAL_Filter.FindEntry(entry)
+    for index, existing in ipairs(AutoAreaLootDB.filterItems) do
+        if EntriesMatch(existing, entry) then return index end
+    end
+    return nil
+end
+
+function AAL_Filter.GetNameAndQuality(item)
+    local name, quality
+    local itemID = tonumber(item.itemID)
+    if itemID and type(GetItemInfo) == "function" then
+        local ok, infoName, _, infoQuality =
+            pcall(GetItemInfo, "item:" .. itemID .. ":0:0:0")
+        if ok then
+            name, quality = infoName, infoQuality
+        end
+    end
+    if type(item.link) == "string" then
+        if not name then
+            name = string.match(item.link, "%[(.-)%]")
+        end
+        if quality == nil then
+            local color = string.match(item.link, "|cff(%x%x%x%x%x%x)")
+            if color then
+                quality = FILTER_QUALITY_BY_COLOR[string.lower(color)]
+            end
+        end
+    end
+    return name, quality
+end
+
+function AAL_Filter.ShouldLoot(item)
+    local itemID = tonumber(item.itemID)
+    if not itemID then return false end
+    local name, quality = AAL_Filter.GetNameAndQuality(item)
+    local lowerName = name and string.lower(name) or nil
+    for _, entry in ipairs(AutoAreaLootDB.filterItems) do
+        if entry.id then
+            if entry.id == itemID then return true end
+        elseif lowerName and entry.name
+            and string.lower(entry.name) == lowerName then
+            return true
+        end
+    end
+    local minQuality = tonumber(AutoAreaLootDB.filterMinQuality) or -1
+    if minQuality >= 0 and quality and quality >= minQuality then
+        return true
+    end
+    return false
+end
+
+function AAL_Filter.GetQualityLabel()
+    local minQuality = tonumber(AutoAreaLootDB.filterMinQuality) or -1
+    if minQuality < 0 then return "off" end
+    return (FILTER_QUALITY_NAMES[minQuality] or tostring(minQuality)) .. " and better"
+end
+
+function AAL_Filter.CycleQuality()
+    local minQuality = tonumber(AutoAreaLootDB.filterMinQuality) or -1
+    minQuality = minQuality + 1
+    if minQuality > 5 then minQuality = -1 end
+    AutoAreaLootDB.filterMinQuality = minQuality
+    return AAL_Filter.GetQualityLabel()
+end
+
+function AAL_Filter.Reset()
+    state.filterQueueActive = false
+    state.filterQueue = nil
+    state.filterCurrent = nil
+    state.filterNextAt = 0
+end
+
+function AAL_Filter.Advance(delay)
+    state.filterCurrent = nil
+    state.filterNextAt = FilterNow() + (delay or 0)
+end
+
+function AAL_Filter.Finish(reason)
+    AAL_Filter.Reset()
+    DebugLog("Filtered loot queue finished: " .. tostring(reason))
+    local ok, duration = pcall(GetAdaptiveLootSettleDuration)
+    if ok and tonumber(duration) then
+        state.lootSettleUntil = FilterNow() + duration
+    end
+    ServicePendingLootRequest()
+end
+
+function AAL_Filter.Apply(results)
+    local filtered, queue = {}, {}
+    local wantMoney = AutoAreaLootDB.filterMoney and true or false
+    for _, corpse in ipairs(results or {}) do
+        local guid = type(corpse.guid) == "string" and corpse.guid or nil
+        if guid then
+            local keptItems = {}
+            for _, item in ipairs(corpse.items or {}) do
+                if AAL_Filter.ShouldLoot(item) then
+                    table.insert(keptItems, item)
+                    table.insert(queue, { guid = guid, itemID = tonumber(item.itemID) })
+                end
+            end
+            local coin = 0
+            if wantMoney then
+                coin = math.max(0, tonumber(corpse.coin) or 0)
+            end
+            if coin > 0 then
+                table.insert(queue, { guid = guid, coin = true })
+            end
+            if table.getn(keptItems) > 0 or coin > 0 then
+                table.insert(filtered, { guid = guid, coin = coin, items = keptItems })
+            end
+        end
+    end
+    DebugLog("Item filter: " .. table.getn(queue) .. " step(s) queued from "
+        .. table.getn(results or {}) .. " corpse(s)")
+    if table.getn(queue) > 0 then
+        state.filterQueue = queue
+        state.filterQueueActive = true
+        state.filterCurrent = nil
+        state.filterNextAt = 0
+        state.filterStartedAt = FilterNow()
+    end
+    return filtered
+end
+
+function AAL_Filter.Tick()
+    if not state.filterQueueActive then return end
+    local now = FilterNow()
+    if now - (state.filterStartedAt or now) > FILTER_QUEUE_TIMEOUT then
+        AAL_Filter.Finish("timeout")
+        return
+    end
+    if now < (state.filterNextAt or 0) then return end
+
+    local step = state.filterCurrent
+    if not step then
+        step = table.remove(state.filterQueue, 1)
+        if not step then
+            AAL_Filter.Finish("done")
+            return
+        end
+        step.attempts = 0
+        state.filterCurrent = step
+    end
+
+    if step.coin then
+        if not step.sent then
+            step.sent = true
+            step.sentAt = now
+            local ok = pcall(C_Loot.LootUnit, step.guid)
+            DebugLog("Filter: opening corpse for money; ok=" .. tostring(ok))
+            if not ok then AAL_Filter.Advance(FILTER_STEP_DELAY) end
+        elseif now - step.sentAt > FILTER_COIN_TIMEOUT then
+            DebugLog("Filter: money step timed out")
+            AAL_Filter.Advance(FILTER_STEP_DELAY)
+        end
+        return
+    end
+
+    step.attempts = step.attempts + 1
+    local ok, result = pcall(C_Loot.LootUnitItem, step.guid, step.itemID)
+    if ok and result then
+        DebugLog("Filter: requested item " .. tostring(step.itemID))
+        AAL_Filter.Advance(FILTER_STEP_DELAY)
+    elseif step.attempts >= FILTER_MAX_ATTEMPTS then
+        DebugLog("Filter: gave up on item " .. tostring(step.itemID))
+        AAL_Filter.Advance(FILTER_STEP_DELAY)
+    else
+        state.filterNextAt = now + FILTER_RETRY_DELAY
+    end
+end
+
+-- Called from LOOT_OPENED while the queue runs. Only money steps use the
+-- loot window; item steps are taken by LootUnitItem without it.
+function AAL_Filter.OnLootOpened()
+    local step = state.filterCurrent
+    if not step or not step.coin or not step.sent then return end
+    local count = type(GetNumLootItems) == "function" and GetNumLootItems() or 0
+    for slot = 1, count do
+        local isCoin
+        if type(LootSlotIsCoin) == "function" then
+            isCoin = LootSlotIsCoin(slot)
+        elseif type(LootSlotIsItem) == "function" then
+            isCoin = not LootSlotIsItem(slot)
+        end
+        if isCoin then pcall(LootSlot, slot) end
+    end
+    if type(CloseLoot) == "function" then pcall(CloseLoot) end
+    DebugLog("Filter: took money from open window")
+    AAL_Filter.Advance(FILTER_STEP_DELAY)
+end
+
+function AAL_Filter.PrintList()
+    local count = table.getn(AutoAreaLootDB.filterItems)
+    FilterPrint("filter is " .. (AutoAreaLootDB.filterEnabled and "ON" or "OFF")
+        .. "; money " .. (AutoAreaLootDB.filterMoney and "looted" or "not looted")
+        .. "; quality rule: " .. AAL_Filter.GetQualityLabel() .. ".")
+    if count == 0 then
+        FilterPrint("item list is empty. Add one with /aal add [shift-click an item]")
+        return
+    end
+    for index, entry in ipairs(AutoAreaLootDB.filterItems) do
+        DEFAULT_CHAT_FRAME:AddMessage("  " .. index .. ". " .. AAL_Filter.EntryLabel(entry))
+    end
+end
+
+local function ParseOnOff(text, current)
+    text = string.lower(text or "")
+    if text == "on" or text == "1" or text == "yes" then return true end
+    if text == "off" or text == "0" or text == "no" then return false end
+    return not current
+end
+
+function AAL_Filter.HandleCommand(sub, rest)
+    if sub == "items" or sub == "menu" then
+        AAL_Filter.ShowMenu()
+        return true
+    elseif sub == "add" then
+        local entry = AAL_Filter.ParseEntry(rest)
+        if not entry then
+            FilterPrint("usage: /aal add [shift-click an item] or /aal add Linen Cloth")
+        elseif AAL_Filter.FindEntry(entry) then
+            FilterPrint(AAL_Filter.EntryLabel(entry) .. " is already on the list.")
+        else
+            table.insert(AutoAreaLootDB.filterItems, entry)
+            FilterPrint("added " .. AAL_Filter.EntryLabel(entry) .. " to the filter list.")
+            AAL_Filter.RefreshAll()
+            if not AutoAreaLootDB.filterEnabled then
+                FilterPrint("the filter is OFF. Turn it on with /aal filter on")
+            end
+        end
+        return true
+    elseif sub == "remove" or sub == "del" then
+        local entry = AAL_Filter.ParseEntry(rest)
+        local index = entry and AAL_Filter.FindEntry(entry)
+        if index then
+            table.remove(AutoAreaLootDB.filterItems, index)
+            FilterPrint("removed " .. AAL_Filter.EntryLabel(entry) .. ".")
+            AAL_Filter.RefreshAll()
+        else
+            FilterPrint("that item is not on the list. See /aal list")
+        end
+        return true
+    elseif sub == "list" then
+        AAL_Filter.PrintList()
+        return true
+    elseif sub == "clear" then
+        AutoAreaLootDB.filterItems = {}
+        FilterPrint("filter item list cleared.")
+        AAL_Filter.RefreshAll()
+        return true
+    elseif sub == "filter" then
+        AutoAreaLootDB.filterEnabled =
+            ParseOnOff(rest, AutoAreaLootDB.filterEnabled)
+        if not AutoAreaLootDB.filterEnabled then AAL_Filter.Reset() end
+        FilterPrint("filter " .. (AutoAreaLootDB.filterEnabled and "ON" or "OFF") .. ".")
+        AAL_Filter.RefreshAll()
+        return true
+    elseif sub == "money" then
+        AutoAreaLootDB.filterMoney =
+            ParseOnOff(rest, AutoAreaLootDB.filterMoney)
+        FilterPrint("money looting with the filter: "
+            .. (AutoAreaLootDB.filterMoney and "ON" or "OFF") .. ".")
+        AAL_Filter.RefreshAll()
+        return true
+    elseif sub == "quality" then
+        local word = string.lower(rest or "")
+        if word == "off" or word == "none" or word == "" then
+            AutoAreaLootDB.filterMinQuality = -1
+        elseif FILTER_QUALITY_ALIASES[word] then
+            AutoAreaLootDB.filterMinQuality = FILTER_QUALITY_ALIASES[word]
+        else
+            FilterPrint("usage: /aal quality off | grey | white | green | blue | purple | orange")
+            return true
+        end
+        FilterPrint("quality rule: " .. AAL_Filter.GetQualityLabel() .. ".")
+        AAL_Filter.RefreshAll()
+        return true
+    elseif sub == "help" then
+        FilterPrint("filter commands:")
+        DEFAULT_CHAT_FRAME:AddMessage("  /aal items  - open the filter menu (drag and drop, search)")
+        DEFAULT_CHAT_FRAME:AddMessage("  /aal filter on|off  - only loot items you chose")
+        DEFAULT_CHAT_FRAME:AddMessage("  /aal add [item]  - add an item (shift-click or type the name)")
+        DEFAULT_CHAT_FRAME:AddMessage("  /aal remove [item]  - remove an item")
+        DEFAULT_CHAT_FRAME:AddMessage("  /aal list  - show the filter")
+        DEFAULT_CHAT_FRAME:AddMessage("  /aal clear  - empty the item list")
+        DEFAULT_CHAT_FRAME:AddMessage("  /aal quality green  - also loot every green or better item (off to disable)")
+        DEFAULT_CHAT_FRAME:AddMessage("  /aal money on|off  - loot money while filtering")
+        return true
+    end
+    return false
+end
+
+-- ===== Filter menu (drag and drop, search) =====
+local MENU_RESULT_ROWS = 5
+local MENU_LIST_ROWS = 7
+local MENU_ROW_HEIGHT = 20
+local MENU_MAX_RESULTS = 150
+local MENU_MIN_QUERY = 3
+local menuFrame
+
+local function GetItemInfoSafe(itemID)
+    if not itemID or type(GetItemInfo) ~= "function" then return nil end
+    local ok, name, link, quality = pcall(GetItemInfo, "item:" .. itemID .. ":0:0:0")
+    if ok and name then return name, quality end
+    return nil
+end
+
+local function GetEntryDisplay(entry)
+    local infoName, quality = GetItemInfoSafe(entry.id)
+    local name = entry.name or infoName or ("item:" .. tostring(entry.id))
+    local color = ITEM_QUALITY_COLORS and quality and ITEM_QUALITY_COLORS[quality]
+    if color then return name, color.r, color.g, color.b, true end
+    return name, 0.902, 0.929, 0.953, infoName ~= nil
+end
+
+function AAL_Filter.AddEntry(entry)
+    if not entry then return false end
+    if AAL_Filter.FindEntry(entry) then
+        FilterPrint(AAL_Filter.EntryLabel(entry) .. " is already on the list.")
+        return false
+    end
+    table.insert(AutoAreaLootDB.filterItems, entry)
+    FilterPrint("added " .. AAL_Filter.EntryLabel(entry) .. " to the filter list.")
+    if not AutoAreaLootDB.filterEnabled then
+        FilterPrint("the filter is OFF. Turn it on in the filter menu or with /aal filter on")
+    end
+    if menuFrame then menuFrame.listOffset = 9999 end
+    AAL_Filter.RefreshAll()
+    return true
+end
+
+function AAL_Filter.RemoveIndex(index)
+    local entry = AutoAreaLootDB.filterItems[index]
+    if not entry then return end
+    table.remove(AutoAreaLootDB.filterItems, index)
+    FilterPrint("removed " .. AAL_Filter.EntryLabel(entry) .. ".")
+    AAL_Filter.RefreshAll()
+end
+
+function AAL_Filter.HandleDrop()
+    if type(GetCursorInfo) ~= "function" then
+        FilterPrint("drag and drop needs the ClassicAPI GetCursorInfo function.")
+        return
+    end
+    local kind, itemID, link = GetCursorInfo()
+    itemID = tonumber(itemID)
+    if kind ~= "item" or not itemID then return end
+    local name
+    if type(link) == "string" then name = string.match(link, "%[(.-)%]") end
+    name = name or GetItemInfoSafe(itemID)
+    if type(ClearCursor) == "function" then pcall(ClearCursor) end
+    local label = name or ("item:" .. itemID)
+    if AAL_Filter.AddEntry({ id = itemID, name = name }) then
+        if type(PlaySound) == "function" then
+            pcall(PlaySound, "igMainMenuOptionCheckBoxOn")
+        end
+        AAL_Filter.ShowDropFeedback("Added: " .. label, 0.3, 1, 0.5, itemID)
+    else
+        AAL_Filter.ShowDropFeedback(label .. " is already on your list.",
+            1, 0.65, 0.2, itemID)
+    end
+end
+
+local function GetItemTextureSafe(itemID)
+    if itemID and type(GetItemInfo) == "function" then
+        local ok, _, _, _, _, _, _, _, _, texture =
+            pcall(GetItemInfo, "item:" .. itemID .. ":0:0:0")
+        if ok and texture then return texture end
+    end
+    return "Interface\\Icons\\INV_Misc_QuestionMark"
+end
+
+local DROP_HINT_TEXT = "Drag an item from your bags onto the slot to add it to your list."
+
+function AAL_Filter.PaintDropSlot()
+    local f = menuFrame
+    if not f or not f.dropSlot then return end
+    local drop, hint = f.dropSlot, f.dropHint
+    if f.feedbackUntil then
+        drop.icon:SetTexture(f.feedbackTexture)
+        drop.icon:Show()
+        drop.plus:Hide()
+        drop:SetBackdropBorderColor(f.feedbackR, f.feedbackG, f.feedbackB, 1)
+        hint:SetText(f.feedbackText)
+        hint:SetTextColor(f.feedbackR, f.feedbackG, f.feedbackB, 1)
+    elseif f.holdingItem then
+        drop.icon:Hide()
+        drop.plus:Show()
+        drop.plus:SetTextColor(0.3, 1, 0.5, 1)
+        drop:SetBackdropBorderColor(0.3, 1, 0.5, 1)
+        hint:SetText("Release the item here to add it to your list.")
+        hint:SetTextColor(0.3, 1, 0.5, 1)
+    else
+        drop.icon:Hide()
+        drop.plus:Show()
+        drop.plus:SetTextColor(0.345, 0.651, 1, 1)
+        if drop.hover then
+            local r, g, b = GetThemeAccentColor()
+            drop:SetBackdropBorderColor(r, g, b, 1)
+        else
+            local r, g, b, a = GetThemeBorderColor()
+            drop:SetBackdropBorderColor(r, g, b, a)
+        end
+        hint:SetText(DROP_HINT_TEXT)
+        hint:SetTextColor(0.902, 0.929, 0.953, 1)
+    end
+end
+
+function AAL_Filter.ShowDropFeedback(text, r, g, b, itemID)
+    local f = menuFrame
+    if not f or not f.dropSlot then return end
+    f.feedbackText = text
+    f.feedbackR, f.feedbackG, f.feedbackB = r, g, b
+    f.feedbackTexture = GetItemTextureSafe(itemID)
+    f.feedbackUntil = FilterNow() + 2.5
+    AAL_Filter.PaintDropSlot()
+end
+
+local function CreateMenuScrollbar(parent, area, rows, getTotal, getOffset, setOffset)
+    local trackHeight = rows * MENU_ROW_HEIGHT
+    local bar = CreateFrame("Frame", nil, parent)
+    bar:SetWidth(8)
+    bar:SetHeight(trackHeight)
+    bar:SetPoint("TOPLEFT", area, "TOPRIGHT", 4, 0)
+    bar:EnableMouse(true)
+    bar:EnableMouseWheel(true)
+
+    local track = bar:CreateTexture(nil, "BACKGROUND")
+    track:SetTexture("Interface\\Buttons\\WHITE8X8")
+    track:SetWidth(2)
+    track:SetHeight(trackHeight)
+    track:SetPoint("TOP", bar, "TOP", 0, 0)
+    local br, bg, bb = GetThemeBorderColor()
+    track:SetVertexColor(br, bg, bb, 0.9)
+
+    local thumb = CreateFrame("Frame", nil, bar)
+    thumb:SetWidth(6)
+    thumb:SetHeight(20)
+    thumb:EnableMouse(true)
+    local thumbTexture = thumb:CreateTexture(nil, "ARTWORK")
+    thumbTexture:SetTexture("Interface\\Buttons\\WHITE8X8")
+    thumbTexture:SetAllPoints(thumb)
+    local ar, ag, ab = GetThemeAccentColor()
+    thumbTexture:SetVertexColor(ar, ag, ab, 0.9)
+    thumb:Hide()
+
+    function bar.Update()
+        local total = getTotal()
+        if total <= rows then
+            thumb:Hide()
+            return
+        end
+        local thumbHeight = math.max(16, trackHeight * rows / total)
+        local travel = trackHeight - thumbHeight
+        local ratio = getOffset() / (total - rows)
+        thumb:SetHeight(thumbHeight)
+        thumb:ClearAllPoints()
+        thumb:SetPoint("TOP", bar, "TOP", 0, -ratio * travel)
+        thumb:Show()
+    end
+
+    local function SetFromCursor(grab)
+        local total = getTotal()
+        if total <= rows then return end
+        local top = bar:GetTop()
+        if not top then return end
+        local _, cursorY = GetCursorPosition()
+        local scale = bar:GetEffectiveScale() or 1
+        local thumbHeight = thumb:GetHeight()
+        local travel = math.max(1, trackHeight - thumbHeight)
+        local y = top - cursorY / scale - (grab or thumbHeight / 2)
+        local ratio = math.max(0, math.min(y / travel, 1))
+        setOffset(math.floor(ratio * (total - rows) + 0.5))
+    end
+
+    bar:SetScript("OnMouseDown", function() SetFromCursor(nil) end)
+    bar:SetScript("OnMouseWheel", function() setOffset(getOffset() - arg1) end)
+    thumb:SetScript("OnMouseWheel", function() setOffset(getOffset() - arg1) end)
+    thumb:SetScript("OnMouseDown", function()
+        local _, cursorY = GetCursorPosition()
+        local scale = bar:GetEffectiveScale() or 1
+        local thumbTop = thumb:GetTop() or 0
+        local grab = thumbTop - cursorY / scale
+        thumb:SetScript("OnUpdate", function()
+            if type(IsMouseButtonDown) == "function"
+                and not IsMouseButtonDown("LeftButton") then
+                thumb:SetScript("OnUpdate", nil)
+                return
+            end
+            SetFromCursor(grab)
+        end)
+    end)
+    thumb:SetScript("OnMouseUp", function() thumb:SetScript("OnUpdate", nil) end)
+    thumb:SetScript("OnHide", function() thumb:SetScript("OnUpdate", nil) end)
+    return bar
+end
+
+local function ShowRowTooltip(row)
+    local entry = row.entry
+    if not entry or not entry.id or not GetItemInfoSafe(entry.id) then return end
+    GameTooltip:SetOwner(row, "ANCHOR_RIGHT")
+    local ok = pcall(GameTooltip.SetHyperlink, GameTooltip, "item:" .. entry.id .. ":0:0:0")
+    if ok then GameTooltip:Show() else GameTooltip:Hide() end
+end
+
+local function CreateMenuRow(parent, index, buttonText, onAction)
+    local row = CreateFrame("Button", nil, parent)
+    row:SetHeight(MENU_ROW_HEIGHT)
+    row:SetPoint("TOPLEFT", parent, "TOPLEFT", 0, -(index - 1) * MENU_ROW_HEIGHT)
+    row:SetPoint("TOPRIGHT", parent, "TOPRIGHT", 0, -(index - 1) * MENU_ROW_HEIGHT)
+    row:SetHighlightTexture("Interface\\Buttons\\WHITE8X8")
+    local highlight = row:GetHighlightTexture()
+    if highlight then highlight:SetVertexColor(1, 1, 1, 0.08) end
+
+    row.text = row:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    row.text:SetPoint("LEFT", row, "LEFT", 4, 0)
+    row.text:SetPoint("RIGHT", row, "RIGHT", -62, 0)
+    row.text:SetJustifyH("LEFT")
+    ApplyLootFont(row.text, 11)
+
+    row.button = CreateAALButton(row, 54, 16, buttonText)
+    row.button:SetPoint("RIGHT", row, "RIGHT", -2, 0)
+    ApplyLootFont(row.button.label, 9)
+    row.button:SetScript("OnClick", function() onAction(row) end)
+
+    row:SetScript("OnClick", function() onAction(row) end)
+    row:SetScript("OnEnter", function() ShowRowTooltip(row) end)
+    row:SetScript("OnLeave", function() GameTooltip:Hide() end)
+    row:Hide()
+    return row
+end
+
+function AAL_Filter.RefreshMenu()
+    if not menuFrame or not menuFrame:IsShown() then return end
+    local results = menuFrame.results or {}
+    local resultCount = table.getn(results)
+    menuFrame.resultOffset = math.max(0, math.min(menuFrame.resultOffset or 0,
+        math.max(0, resultCount - MENU_RESULT_ROWS)))
+    for index = 1, MENU_RESULT_ROWS do
+        local row = menuFrame.resultRows[index]
+        local entry = results[menuFrame.resultOffset + index]
+        if entry then
+            row.entry = entry
+            local name, r, g, b = GetEntryDisplay(entry)
+            row.text:SetText(name)
+            row.text:SetTextColor(r, g, b, 1)
+            row.button.label:SetText(AAL_Filter.FindEntry(entry) and "Added" or "Add")
+            row:Show()
+        else
+            row.entry = nil
+            row:Hide()
+        end
+    end
+    menuFrame.resultsHeader:SetText("Results (" .. resultCount .. ")")
+    menuFrame.noteText:SetText(menuFrame.note or "")
+
+    local list = AutoAreaLootDB.filterItems
+    local listCount = table.getn(list)
+    menuFrame.listOffset = math.max(0, math.min(menuFrame.listOffset or 0,
+        math.max(0, listCount - MENU_LIST_ROWS)))
+    for index = 1, MENU_LIST_ROWS do
+        local row = menuFrame.listRows[index]
+        local entry = list[menuFrame.listOffset + index]
+        if entry then
+            row.entry = entry
+            row.listIndex = menuFrame.listOffset + index
+            local name, r, g, b = GetEntryDisplay(entry)
+            row.text:SetText(name)
+            row.text:SetTextColor(r, g, b, 1)
+            row:Show()
+        else
+            row.entry = nil
+            row:Hide()
+        end
+    end
+    menuFrame.listHeader:SetText("Your filter list (" .. listCount .. ")")
+    menuFrame.emptyText:SetText(listCount == 0
+        and "Empty. Drop an item on the slot above or add one from the results." or "")
+    menuFrame.filterToggle:SetChecked(AutoAreaLootDB.filterEnabled)
+    menuFrame.moneyToggle:SetChecked(AutoAreaLootDB.filterMoney)
+    if menuFrame.resultBar then menuFrame.resultBar.Update() end
+    if menuFrame.listBar then menuFrame.listBar.Update() end
+end
+
+-- Asks pfQuest's HearthDB (SQLite) database for items by name or ID. It answers
+-- later, so the result list is handed to `callback`. Returns true if accepted.
+function AAL_Filter.SearchHDB(query, callback)
+    if type(pfDatabase) ~= "table"
+        or type(pfDatabase.SearchItemTitlesHDB) ~= "function" then
+        return false
+    end
+    local ok, accepted = pcall(pfDatabase.SearchItemTitlesHDB, pfDatabase,
+        query, MENU_MAX_RESULTS, function(data, err)
+            local list = {}
+            if not err and type(data) == "table" then
+                for id, value in pairs(data) do
+                    local name = type(value) == "table" and value.title or value
+                    id = tonumber(id)
+                    if id and type(name) == "string" then
+                        table.insert(list, { id = id, name = name })
+                    end
+                end
+            end
+            pcall(callback, list)
+        end)
+    return (ok and accepted) and true or false
+end
+
+function AAL_Filter.RunSearch()
+    if not menuFrame then return end
+    local text = menuFrame.searchBox:GetText()
+    local query = string.match(text or "", "^%s*(.-)%s*$") or ""
+    menuFrame.searchRequest = (menuFrame.searchRequest or 0) + 1
+    local request = menuFrame.searchRequest
+    menuFrame.results = {}
+    menuFrame.resultOffset = 0
+
+    if query == "" or (string.len(query) < MENU_MIN_QUERY and not tonumber(query)) then
+        menuFrame.note = "Type at least " .. MENU_MIN_QUERY
+            .. " letters to search the pfQuest database."
+        AAL_Filter.RefreshMenu()
+        return
+    end
+
+    menuFrame.note = "Searching the pfQuest database..."
+    AAL_Filter.RefreshMenu()
+    local accepted = AAL_Filter.SearchHDB(query, function(list)
+        if not menuFrame or request ~= menuFrame.searchRequest then return end
+        table.sort(list, function(a, b)
+            return string.lower(a.name) < string.lower(b.name)
+        end)
+        menuFrame.results = list
+        menuFrame.resultOffset = 0
+        menuFrame.note = table.getn(list) .. " match(es) from the pfQuest database."
+        AAL_Filter.RefreshMenu()
+    end)
+    if not accepted then
+        menuFrame.note = "Search needs pfQuest-HDB and HearthDB.dll. "
+            .. "You can still drag items onto the slot or use /aal add."
+        AAL_Filter.RefreshMenu()
+    end
+end
+
+function AAL_Filter.RefreshAll()
+    if AAL_RefreshConfig then AAL_RefreshConfig() end
+    AAL_Filter.RefreshMenu()
+end
+
+local function CreateMenuLabel(parent, x, y, text, size)
+    local label = parent:CreateFontString(nil, "ARTWORK", "GameFontNormalSmall")
+    label:SetPoint("TOPLEFT", parent, "TOPLEFT", x, y)
+    ApplyLootFont(label, size or 10)
+    label:SetTextColor(0.902, 0.929, 0.953, 1)
+    label:SetJustifyH("LEFT")
+    label:SetText(text or "")
+    return label
+end
+
+local function CreateFilterMenu()
+    if menuFrame then return end
+    menuFrame = CreateFrame("Frame", "AutoAreaLootFilterMenu", UIParent)
+    menuFrame:SetWidth(340)
+    menuFrame:SetHeight(450)
+    menuFrame:SetPoint("CENTER", UIParent, "CENTER", 0, 20)
+    menuFrame:SetFrameStrata("DIALOG")
+    menuFrame:SetToplevel(true)
+    menuFrame:SetMovable(true)
+    menuFrame:EnableMouse(true)
+    menuFrame:RegisterForDrag("LeftButton")
+    menuFrame:SetScript("OnDragStart", function() this:StartMoving() end)
+    menuFrame:SetScript("OnDragStop", function() this:StopMovingOrSizing() end)
+    ApplyThemeBackdrop(menuFrame, 0.92, true)
+    menuFrame.results = {}
+    menuFrame.resultOffset = 0
+    menuFrame.listOffset = 0
+
+    -- Solid fill so the settings panel behind the menu does not show through.
+    local solid = menuFrame:CreateTexture(nil, "BACKGROUND")
+    solid:SetTexture("Interface\\Buttons\\WHITE8X8")
+    solid:SetPoint("TOPLEFT", menuFrame, "TOPLEFT", 1, -1)
+    solid:SetPoint("BOTTOMRIGHT", menuFrame, "BOTTOMRIGHT", -1, 1)
+    do
+        local r, g, b = GetThemeBackgroundColor()
+        solid:SetVertexColor(r, g, b, 1)
+    end
+
+    local header = menuFrame:CreateTexture(nil, "BACKGROUND")
+    header:SetTexture("Interface\\Buttons\\WHITE8X8")
+    header:SetPoint("TOPLEFT", menuFrame, "TOPLEFT", 1, -1)
+    header:SetPoint("TOPRIGHT", menuFrame, "TOPRIGHT", -1, -1)
+    header:SetHeight(30)
+    if IsPfUIThemeActive() then
+        local r, g, b = GetThemeBackgroundColor()
+        header:SetVertexColor(r, g, b, 0.75)
+    else
+        header:SetVertexColor(0.090, 0.153, 0.243, 0.55)
+    end
+
+    local accent = menuFrame:CreateTexture(nil, "BORDER")
+    accent:SetTexture("Interface\\Buttons\\WHITE8X8")
+    accent:SetPoint("TOPLEFT", menuFrame, "TOPLEFT", 1, -1)
+    accent:SetPoint("TOPRIGHT", menuFrame, "TOPRIGHT", -1, -1)
+    accent:SetHeight(2)
+    local accentR, accentG, accentB = GetThemeAccentColor()
+    accent:SetVertexColor(accentR, accentG, accentB, 0.85)
+
+    local title = menuFrame:CreateFontString(nil, "ARTWORK", "GameFontNormalLarge")
+    title:SetPoint("TOP", menuFrame, "TOP", 0, -10)
+    ApplyLootFont(title, 12)
+    title:SetTextColor(0.902, 0.929, 0.953, 1)
+    title:SetText("AutoAreaLoot Filter")
+
+    local close = CreateAALButton(menuFrame, 18, 18, "X")
+    close:SetPoint("TOPRIGHT", menuFrame, "TOPRIGHT", -6, -6)
+    ApplyLootFont(close.label, 9)
+    StyleCloseButton(close)
+    close:SetScript("OnClick", function() menuFrame:Hide() end)
+
+    -- Drop slot
+    local drop = CreateFrame("Button", nil, menuFrame)
+    drop:SetWidth(36)
+    drop:SetHeight(36)
+    drop:SetPoint("TOPLEFT", menuFrame, "TOPLEFT", 14, -40)
+    ApplyThemeBackdrop(drop, 0.95)
+    drop.icon = drop:CreateTexture(nil, "ARTWORK")
+    drop.icon:SetPoint("TOPLEFT", drop, "TOPLEFT", 3, -3)
+    drop.icon:SetPoint("BOTTOMRIGHT", drop, "BOTTOMRIGHT", -3, 3)
+    drop.icon:SetTexCoord(0.07, 0.93, 0.07, 0.93)
+    drop.icon:Hide()
+    drop.plus = drop:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
+    drop.plus:SetPoint("CENTER", drop, "CENTER", 0, 0)
+    ApplyLootFont(drop.plus, 22)
+    drop.plus:SetTextColor(0.345, 0.651, 1, 1)
+    drop.plus:SetText("+")
+    drop:RegisterForClicks("LeftButtonUp")
+    drop:SetScript("OnReceiveDrag", function() AAL_Filter.HandleDrop() end)
+    drop:SetScript("OnClick", function() AAL_Filter.HandleDrop() end)
+    drop:SetScript("OnEnter", function()
+        drop.hover = true
+        AAL_Filter.PaintDropSlot()
+    end)
+    drop:SetScript("OnLeave", function()
+        drop.hover = false
+        AAL_Filter.PaintDropSlot()
+    end)
+    menuFrame.dropSlot = drop
+
+    local dropHint = CreateMenuLabel(menuFrame, 58, -42, DROP_HINT_TEXT, 10)
+    dropHint:SetWidth(268)
+    dropHint:SetHeight(32)
+    dropHint:SetJustifyV("TOP")
+    menuFrame.dropHint = dropHint
+
+    -- Search
+    CreateMenuLabel(menuFrame, 14, -92, "Search:", 10)
+    local box = CreateFrame("EditBox", nil, menuFrame)
+    box:SetPoint("TOPLEFT", menuFrame, "TOPLEFT", 62, -88)
+    box:SetWidth(264)
+    box:SetHeight(20)
+    box:SetAutoFocus(false)
+    box:SetTextInsets(5, 5, 0, 0)
+    box:SetMaxLetters(60)
+    ApplyLootFont(box, 11)
+    box:SetTextColor(0.902, 0.929, 0.953, 1)
+    ApplyThemeBackdrop(box, 0.95)
+    box:SetScript("OnEscapePressed", function() this:ClearFocus() end)
+    box:SetScript("OnEnterPressed", function()
+        this:ClearFocus()
+        menuFrame.searchDue = nil
+        AAL_Filter.RunSearch()
+    end)
+    box:SetScript("OnTextChanged", function()
+        menuFrame.searchDue = FilterNow() + 0.3
+    end)
+    menuFrame.searchBox = box
+
+    -- Results
+    menuFrame.resultsHeader = CreateMenuLabel(menuFrame, 14, -118, "Results", 10)
+    local resultsArea = CreateFrame("Frame", nil, menuFrame)
+    resultsArea:SetPoint("TOPLEFT", menuFrame, "TOPLEFT", 14, -134)
+    resultsArea:SetPoint("TOPRIGHT", menuFrame, "TOPRIGHT", -26, -134)
+    resultsArea:SetHeight(MENU_RESULT_ROWS * MENU_ROW_HEIGHT)
+    resultsArea:EnableMouseWheel(true)
+    resultsArea:SetScript("OnMouseWheel", function()
+        menuFrame.resultOffset = (menuFrame.resultOffset or 0) - arg1
+        AAL_Filter.RefreshMenu()
+    end)
+    menuFrame.resultRows = {}
+    for index = 1, MENU_RESULT_ROWS do
+        menuFrame.resultRows[index] = CreateMenuRow(resultsArea, index, "Add",
+            function(row)
+                if row.entry and not AAL_Filter.FindEntry(row.entry) then
+                    AAL_Filter.AddEntry({ id = row.entry.id, name = row.entry.name })
+                end
+            end)
+    end
+    menuFrame.noteText = CreateMenuLabel(menuFrame, 14, -238, "", 9)
+    menuFrame.noteText:SetWidth(312)
+    menuFrame.noteText:SetTextColor(0.65, 0.70, 0.75, 1)
+
+    -- Your list
+    menuFrame.listHeader = CreateMenuLabel(menuFrame, 14, -262, "Your filter list", 10)
+    local listArea = CreateFrame("Frame", nil, menuFrame)
+    listArea:SetPoint("TOPLEFT", menuFrame, "TOPLEFT", 14, -278)
+    listArea:SetPoint("TOPRIGHT", menuFrame, "TOPRIGHT", -26, -278)
+    listArea:SetHeight(MENU_LIST_ROWS * MENU_ROW_HEIGHT)
+    listArea:EnableMouseWheel(true)
+    listArea:SetScript("OnMouseWheel", function()
+        menuFrame.listOffset = (menuFrame.listOffset or 0) - arg1
+        AAL_Filter.RefreshMenu()
+    end)
+    menuFrame.listRows = {}
+    for index = 1, MENU_LIST_ROWS do
+        menuFrame.listRows[index] = CreateMenuRow(listArea, index, "Remove",
+            function(row)
+                if row.listIndex and row.entry then
+                    AAL_Filter.RemoveIndex(row.listIndex)
+                end
+            end)
+    end
+    menuFrame.emptyText = CreateMenuLabel(menuFrame, 18, -286, "", 9)
+    menuFrame.emptyText:SetWidth(300)
+    menuFrame.emptyText:SetTextColor(0.65, 0.70, 0.75, 1)
+
+    menuFrame.resultBar = CreateMenuScrollbar(menuFrame, resultsArea,
+        MENU_RESULT_ROWS,
+        function() return table.getn(menuFrame.results or {}) end,
+        function() return menuFrame.resultOffset or 0 end,
+        function(value)
+            menuFrame.resultOffset = value
+            AAL_Filter.RefreshMenu()
+        end)
+    menuFrame.listBar = CreateMenuScrollbar(menuFrame, listArea,
+        MENU_LIST_ROWS,
+        function() return table.getn(AutoAreaLootDB.filterItems) end,
+        function() return menuFrame.listOffset or 0 end,
+        function(value)
+            menuFrame.listOffset = value
+            AAL_Filter.RefreshMenu()
+        end)
+
+    -- Toggles
+    menuFrame.filterToggle = CreateAALToggle(menuFrame, "Filter on",
+        AutoAreaLootDB.filterEnabled, function(checked)
+            AutoAreaLootDB.filterEnabled = checked
+            if not checked then AAL_Filter.Reset() end
+            AAL_Filter.RefreshAll()
+        end)
+    menuFrame.filterToggle:SetPoint("TOPLEFT", menuFrame, "TOPLEFT", 20, -426)
+    menuFrame.moneyToggle = CreateAALToggle(menuFrame, "Also loot money",
+        AutoAreaLootDB.filterMoney, function(checked)
+            AutoAreaLootDB.filterMoney = checked
+            AAL_Filter.RefreshAll()
+        end)
+    menuFrame.moneyToggle:SetPoint("TOPLEFT", menuFrame, "TOPLEFT", 150, -426)
+
+    menuFrame:SetScript("OnShow", function()
+        AAL_Filter.RunSearch()
+    end)
+    menuFrame:SetScript("OnHide", function()
+        GameTooltip:Hide()
+        menuFrame.searchDue = nil
+    end)
+    menuFrame:SetScript("OnUpdate", function()
+        local now = FilterNow()
+        if menuFrame.searchDue and now >= menuFrame.searchDue then
+            menuFrame.searchDue = nil
+            AAL_Filter.RunSearch()
+        end
+        local holding = false
+        if type(GetCursorInfo) == "function" then
+            holding = (GetCursorInfo() == "item")
+        end
+        if holding ~= menuFrame.holdingItem then
+            menuFrame.holdingItem = holding
+            AAL_Filter.PaintDropSlot()
+        end
+        if menuFrame.feedbackUntil and now >= menuFrame.feedbackUntil then
+            menuFrame.feedbackUntil = nil
+            AAL_Filter.PaintDropSlot()
+        end
+    end)
+    menuFrame:Hide()
+end
+
+function AAL_Filter.ShowMenu()
+    if not state.initialized then return end
+    CreateFilterMenu()
+    if menuFrame:IsShown() then
+        menuFrame:Hide()
+    else
+        menuFrame:Show()
+    end
+end
+
+-- ESC closes one window at a time: the filter menu first, then the settings
+-- panel. A hidden helper frame is what ESC actually closes (WoW closes every
+-- registered frame at once), and it decides which real window to close.
+do
+    local escProxy = CreateFrame("Frame", "AutoAreaLootEscProxy", UIParent)
+    escProxy:Hide()
+    local syncing = false
+
+    local function IsOpen(frame)
+        return frame and frame:IsShown() and true or false
+    end
+
+    local function SyncEscProxy()
+        local wanted = IsOpen(menuFrame) or IsOpen(AutoAreaLootConfigFrame)
+        if wanted ~= IsOpen(escProxy) then
+            syncing = true
+            if wanted then escProxy:Show() else escProxy:Hide() end
+            syncing = false
+        end
+    end
+
+    escProxy:SetScript("OnHide", function()
+        if syncing then return end
+        if IsOpen(menuFrame) then
+            menuFrame:Hide()
+        elseif IsOpen(AutoAreaLootConfigFrame) then
+            AutoAreaLootConfigFrame:Hide()
+        end
+        SyncEscProxy()
+    end)
+
+    local watcher = CreateFrame("Frame", nil, UIParent)
+    local waited = 0
+    watcher:SetScript("OnUpdate", function()
+        waited = waited + (arg1 or 0)
+        if waited < 0.1 then return end
+        waited = 0
+        SyncEscProxy()
+    end)
+
+    if type(UISpecialFrames) == "table" then
+        table.insert(UISpecialFrames, "AutoAreaLootEscProxy")
+    end
+end
+
 local function SetEnabled(enabled)
     AutoAreaLootDB.enabled = enabled and true or false
     DebugLog("Addon enabled set to " .. tostring(AutoAreaLootDB.enabled))
     if not AutoAreaLootDB.enabled then
+        if AAL_Filter then AAL_Filter.Reset() end
         state.lootRequestTimer = nil
         state.lootSettleUntil = nil
         state.pendingLootReason = nil
@@ -2061,6 +3101,9 @@ end
 
 local function RefreshConfigPanel()
     if not configFrame or not state.initialized then return end
+    configFrame.filterCheck:SetChecked(AutoAreaLootDB.filterEnabled)
+    configFrame.filterMoneyCheck:SetChecked(AutoAreaLootDB.filterMoney)
+    configFrame.qualityButton.label:SetText("Quality: " .. AAL_Filter.GetQualityLabel())
     configFrame.enabledCheck:SetChecked(AutoAreaLootDB.enabled)
     configFrame.deathCheck:SetChecked(AutoAreaLootDB.lootOnDeath)
     configFrame.stopCheck:SetChecked(AutoAreaLootDB.lootOnStop)
@@ -2073,7 +3116,7 @@ local function CreateConfigPanel()
 
     configFrame = CreateFrame("Frame", "AutoAreaLootConfigFrame", UIParent)
     configFrame:SetWidth(260)
-    configFrame:SetHeight(186)
+    configFrame:SetHeight(296)
     configFrame:SetPoint("CENTER", UIParent, "CENTER", 0, 80)
     configFrame:SetFrameStrata("DIALOG")
     configFrame:SetToplevel(true)
@@ -2128,6 +3171,25 @@ local function CreateConfigPanel()
     configFrame.openLogCheck = CreateCheckButton(
         configFrame, "Open loot log on login/reload", -140, "openLootLogOnLogin")
 
+    configFrame.filterCheck = CreateCheckButton(
+        configFrame, "Only loot items on my list", -164, "filterEnabled")
+    configFrame.filterMoneyCheck = CreateCheckButton(
+        configFrame, "Also loot money", -188, "filterMoney")
+
+    local qualityButton = CreateAALButton(configFrame, 180, 18, "Quality: off")
+    qualityButton:SetPoint("TOP", configFrame, "TOP", 0, -212)
+    ApplyLootFont(qualityButton.label, 10)
+    qualityButton:SetScript("OnClick", function()
+        AAL_Filter.CycleQuality()
+        RefreshConfigPanel()
+    end)
+    configFrame.qualityButton = qualityButton
+
+    local menuButton = CreateAALButton(configFrame, 180, 18, "Edit Filter List...")
+    menuButton:SetPoint("TOP", configFrame, "TOP", 0, -238)
+    ApplyLootFont(menuButton.label, 10)
+    menuButton:SetScript("OnClick", function() AAL_Filter.ShowMenu() end)
+
     local logButton = CreateAALButton(configFrame, 118, 18, "Open Loot Log")
     logButton:SetPoint("BOTTOM", configFrame, "BOTTOM", 0, 7)
     ApplyLootFont(logButton.label, 10)
@@ -2135,6 +3197,8 @@ local function CreateConfigPanel()
 
     configFrame:Hide()
 end
+
+AAL_RefreshConfig = RefreshConfigPanel
 
 local function ShowConfigPanel()
     CreateConfigPanel()
@@ -2369,6 +3433,10 @@ eventFrame:SetScript("OnEvent", function()
     end
 
     if event == "LOOT_OPENED" then
+        if state.filterQueueActive then
+            AAL_Filter.OnLootOpened()
+            return
+        end
         if state.lootWalkActive then
             state.autoLootWindowOpen = true
             DebugLog("Loot window opened during automatic walk; closing it")
@@ -2394,6 +3462,7 @@ eventFrame:SetScript("OnEvent", function()
     end
 
     if event == "PLAYER_ENTERING_WORLD" then
+        AAL_Filter.Reset()
         state.moneyBaseline = SafeGetMoney()
         state.playerMoving = false
         state.movementStateKnown = false
@@ -2492,6 +3561,8 @@ end)
 eventFrame:SetScript("OnUpdate", function()
     if not state.initialized then return end
 
+    if state.filterQueueActive then AAL_Filter.Tick() end
+
     state.playerStateSampleElapsed = state.playerStateSampleElapsed + arg1
     if state.playerStateSampleElapsed >= PLAYER_STATE_SAMPLE_INTERVAL then
         state.playerStateSampleElapsed = 0
@@ -2519,6 +3590,12 @@ SLASH_AUTOAREA_LOOT1 = "/aal"
 SlashCmdList["AUTOAREA_LOOT"] = function(message)
     if not state.initialized then return end
     local command = string.lower(string.match(message or "", "^%s*(.-)%s*$"))
+    local filterSub, filterRest = string.match(
+        string.match(message or "", "^%s*(.-)%s*$"), "^(%S+)%s*(.-)$")
+    if filterSub and AAL_Filter
+        and AAL_Filter.HandleCommand(string.lower(filterSub), filterRest) then
+        return
+    end
 
     if command == "on" then
         SetEnabled(true)
@@ -2534,6 +3611,7 @@ SlashCmdList["AUTOAREA_LOOT"] = function(message)
             .. "; death trigger " .. (AutoAreaLootDB.lootOnDeath and "on" or "off")
             .. "; stop trigger " .. (AutoAreaLootDB.lootOnStop and "on" or "off")
             .. "; combat looting " .. (AutoAreaLootDB.lootInCombat and "on" or "off")
+            .. "; item filter " .. (AutoAreaLootDB.filterEnabled and "on" or "off")
             .. ".")
     elseif command == "log" then
         ShowLootLog()
