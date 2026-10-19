@@ -1,5 +1,11 @@
 # AutoAreaLoot
 
+[![ClassicAPI](https://img.shields.io/badge/ClassicAPI-Required-800080?labelColor=555555&style=flat-square)](CLASSICAPI_LINK)
+[![Nampower](https://img.shields.io/badge/Nampower-Required-800080?labelColor=555555&style=flat-square)](https://github.com/brues-code/nampower)
+[![pfQuest](https://img.shields.io/badge/pfQuest-Optional-dfb317?labelColor=555555&style=flat-square)](https://github.com/shagu/pfQuest)
+[![HearthDB](https://img.shields.io/badge/HearthDB-Optional-dfb317?labelColor=555555&style=flat-square)](https://github.com/copypasteonly/HearthDB)# AutoAreaLoot
+[![Join our Discord](https://img.shields.io/badge/Discord-Join%20our%20server-5865F2?logo=discord&logoColor=white)](https://discord.gg/XDMJVczNcY)
+
 AutoAreaLoot automatically loots nearby corpses when it is safe to do so.
 
 ## Behavior
@@ -63,7 +69,7 @@ This fork can loot only the items you choose instead of everything.
 | [ClassicAPI](https://github.com/brues-code/ClassicAPI) DLL with `C_Loot.ScanNearbyLoot`, `C_Loot.LootUnitItem` and `C_Loot.LootUnit` | The item filter (required when the filter is on) |
 | [pfQuest-HDB](https://github.com/rivi-s/pfQuest-HDB-Install) | Searching items in the filter menu |
 | [HearthDB.dll](https://github.com/copypasteonly/HearthDB) | Required by pfQuest-HDB to read its item database |
-| Nampower | Reliable death detection (optional) |
+| [Nampower](https://github.com/brues-code/nampower) | Reliable death detection |
 
 AutoAreaLoot checks for the ClassicAPI functions at runtime and prints a chat
 message if they are missing. With the filter on and the filter functions
