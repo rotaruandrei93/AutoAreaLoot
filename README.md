@@ -50,8 +50,8 @@ This fork can loot only the items you choose instead of everything.
 - Items that are not wanted stay on the corpse
 - The filter menu (`/aal items`, or **Edit Filter List...** in `/aal`):
   - drag an item from your bags onto the **+** slot to add it
-  - search by name or item ID across your bags, items that have dropped for
-    you, and the pfQuest item database
+  - search by name or item ID in the pfQuest-HDB item database (needs
+    pfQuest-HDB and HearthDB.dll)
   - scrollable result and filter lists with an **Add** / **Remove** button per item
 - ESC closes the filter menu first, then the settings panel
 
@@ -61,23 +61,24 @@ This fork can loot only the items you choose instead of everything.
 | --- | --- |
 | [ClassicAPI](https://github.com/brues-code/ClassicAPI) DLL with `C_Loot.LootAllCorpses` | Normal looting (required) |
 | [ClassicAPI](https://github.com/brues-code/ClassicAPI) DLL with `C_Loot.ScanNearbyLoot`, `C_Loot.LootUnitItem` and `C_Loot.LootUnit` | The item filter (required when the filter is on) |
-| [HearthDB.dll](https://github.com/copypasteonly/HearthDB) | Reading the pfQuest-HDB item database (optional) |
-| [pfQuest-HDB](https://github.com/rivi-s/pfQuest-HDB-Install) | Searching the full item database in the filter menu (optional) |
+| [pfQuest-HDB](https://github.com/rivi-s/pfQuest-HDB-Install) | Searching items in the filter menu |
+| [HearthDB.dll](https://github.com/copypasteonly/HearthDB) | Required by pfQuest-HDB to read its item database |
 | Nampower | Reliable death detection (optional) |
 
 AutoAreaLoot checks for the ClassicAPI functions at runtime and prints a chat
 message if they are missing. With the filter on and the filter functions
 missing, nothing is looted until the DLL is updated or the filter is turned off.
 
-### HearthDB (optional)
+### Item search (pfQuest-HDB + HearthDB)
 
-The [pfQuest-HDB](https://github.com/rivi-s/pfQuest-HDB-Install) edition keeps
-its item names in a SQLite database that is read through
-[HearthDB.dll](https://github.com/copypasteonly/HearthDB). With both installed,
-the filter menu search can find any item pfQuest knows, including Turtle WoW
-custom items. Without it, the search still lists items in your bags
-and items that have dropped for you, and you can always add an item by name
-with `/aal add Item Name`.
+The filter menu search uses only the
+[pfQuest-HDB](https://github.com/rivi-s/pfQuest-HDB-Install) item database,
+which is read through [HearthDB.dll](https://github.com/copypasteonly/HearthDB).
+It can find any item pfQuest knows, including Turtle WoW custom items. There is
+no other search source: without pfQuest-HDB and HearthDB the menu shows a
+message and the search returns nothing. Adding items does not need the search:
+you can always drag an item from your bags onto the **+** slot or use
+`/aal add Item Name`.
 
 Nampower is optional. When its `UNIT_DIED` event is available, the addon uses it; otherwise it falls back to `CHAT_MSG_COMBAT_HOSTILE_DEATH`.
 
