@@ -1,9 +1,9 @@
-local LOOT_REQUEST_DELAY = 0.10
-local DEATH_LOOT_REQUEST_DELAY = 0.25
-local POST_SCAN_SETTLE_MIN = 0.35
-local POST_SCAN_SETTLE_MAX = 1.25
-local POST_SCAN_SETTLE_CUSHION = 0.25
-local POST_SCAN_LATENCY_MULTIPLIER = 2
+local LOOT_REQUEST_DELAY = 0.02
+local DEATH_LOOT_REQUEST_DELAY = 0.15
+local POST_SCAN_SETTLE_MIN = 0.05
+local POST_SCAN_SETTLE_MAX = 0.40
+local POST_SCAN_SETTLE_CUSHION = 0.05
+local POST_SCAN_LATENCY_MULTIPLIER = 1.5
 local STOP_LOOT_GRACE = 0.15
 local STOP_LOOT_GRACE_MOVEMENT_TOLERANCE = 0.20
 local MOVEMENT_SPEED_EPSILON = 0.01
@@ -31,10 +31,11 @@ local defaults = {
     lootOnDeath = true,
     lootOnStop = true,
     lootInCombat = true,
+    lootWhileMoving = true,
     lootCombine = false,
     openLootLogOnLogin = false,
     filterEnabled = false,
-    filterMoney = true,
+    lootMoneyFullCorpse = false,
     filterMinQuality = -1,
     filterItems = {},
     lootLogWidth = 280,
@@ -1542,6 +1543,11 @@ local function IsPlayerCurrentlyMoving()
     return state.playerMoving and true or false
 end
 
+-- With "Loot while moving" on, walking does not hold looting back.
+local function IsMovementBlockingLoot()
+    return IsPlayerCurrentlyMoving() and not AutoAreaLootDB.lootWhileMoving
+end
+
 local function GetUnitWorldPosition(unit)
     if type(UnitPosition) ~= "function" then return nil end
     local ok, first, second, third = pcall(UnitPosition, unit)
@@ -1673,16 +1679,16 @@ local function LootNearbyCorpses(source)
     end
     if AutoAreaLootDB.filterEnabled and AAL_Filter
         and not AAL_Filter.HasAPI() then
-        DebugLog("Loot request stopped: filter needs ScanNearbyLoot/LootUnitItem/LootUnit")
+        DebugLog("Loot request stopped: filter needs GetNearbyLootableUnits/LootUnit")
         if not state.filterApiWarned then
             state.filterApiWarned = true
-            DEFAULT_CHAT_FRAME:AddMessage("AutoAreaLoot: the item filter needs a newer ClassicAPI DLL (C_Loot.ScanNearbyLoot and C_Loot.LootUnitItem). Nothing will be looted until you update it or turn the filter off.")
+            DEFAULT_CHAT_FRAME:AddMessage("AutoAreaLoot: the item filter needs a ClassicAPI DLL with C_Loot.GetNearbyLootableUnits and C_Loot.LootUnit. Nothing will be looted until you update it or turn the filter off.")
         end
         return false
     end
-    if state.filterQueueActive then
+    if state.filterWalk then
         QueuePendingLootRequest(source)
-        DebugLog("Loot request deferred: filtered loot queue is running; source=" .. source)
+        DebugLog("Loot request deferred: filtered loot walk is running; source=" .. source)
         return false
     end
 
@@ -1693,7 +1699,7 @@ local function LootNearbyCorpses(source)
         return false
     end
 
-    if IsPlayerCurrentlyMoving() then
+    if IsMovementBlockingLoot() then
         QueuePendingLootRequest(source)
         DebugLog("Loot request deferred: player is moving; source=" .. source)
         return false
@@ -1778,14 +1784,18 @@ local function LootNearbyCorpses(source)
 
     state.pendingLootReason = nil
     local capture = { events = {} }
-    capture.filtered = AutoAreaLootDB.filterEnabled and true or false
+    local fullPass = state.forceFullLoot
+        and type(GetTime) == "function" and (GetTime() - state.forceFullLoot) < 10
+    state.forceFullLoot = nil
+    if fullPass then DebugLog("Full loot pass for corpses that hold money") end
+    capture.filtered = (AutoAreaLootDB.filterEnabled and not fullPass) and true or false
     state.activeCapture = capture
     state.lootWalkActive = true
     state.lootWalkStartedAt = type(GetTime) == "function" and GetTime() or nil
     local callOK, callResult
     if capture.filtered then
-        DebugLog("Calling C_Loot.ScanNearbyLoot (item filter is on)")
-        callOK, callResult = pcall(C_Loot.ScanNearbyLoot)
+        DebugLog("Starting filtered corpse walk (item filter is on)")
+        callOK, callResult = pcall(AAL_Filter.StartWalk)
     else
         DebugLog("Calling C_Loot.LootAllCorpses")
         callOK, callResult = pcall(C_Loot.LootAllCorpses)
@@ -1818,7 +1828,7 @@ ScheduleLootRequest = function(delay, source)
         DebugLog("Schedule skipped: addon disabled")
         return
     end
-    if IsPlayerCurrentlyMoving() then
+    if IsMovementBlockingLoot() then
         QueuePendingLootRequest(source)
         DebugLog("Schedule deferred while player is moving; source=" .. source)
         return
@@ -1902,7 +1912,7 @@ local function ScheduleStableStopLoot(source)
             return
         end
         state.stopGraceTimer = nil
-        if IsPlayerCurrentlyMoving() then
+        if IsMovementBlockingLoot() then
             QueuePendingLootRequest(token.source)
             DebugLog("Stable-stop request deferred: movement-start event received")
             return
@@ -1935,7 +1945,7 @@ local function ScheduleStableStopLoot(source)
     end)
 end
 
-CompleteActiveLootWalk = function()
+CompleteActiveLootWalk = function(injectedResults)
     if not state.lootWalkActive then
         DebugLog("Completion ignored: no local corpse walk is active")
         return false
@@ -1954,7 +1964,11 @@ CompleteActiveLootWalk = function()
 
     if capture then
         local results = {}
-        if type(C_Loot.GetLastScanResults) == "function" then
+        if injectedResults then
+            results = injectedResults
+            DebugLog("Filtered walk produced " .. table.getn(results)
+                .. " corpse result(s)")
+        elseif type(C_Loot.GetLastScanResults) == "function" then
             local resultsOK, returnedResults = pcall(C_Loot.GetLastScanResults)
             if resultsOK and type(returnedResults) == "table" then
                 results = returnedResults
@@ -1980,15 +1994,6 @@ CompleteActiveLootWalk = function()
                 DebugLog("Discarded redundant stop/combat follow-up after successful scan")
             end
         end
-        if capture.filtered and AAL_Filter then
-            local filterOK, filteredResults = pcall(AAL_Filter.Apply, results)
-            if filterOK and type(filteredResults) == "table" then
-                results = filteredResults
-            else
-                DebugLog("Item filter failed: " .. tostring(filteredResults))
-                results = {}
-            end
-        end
         -- Any logging failure ends here and cannot affect looting.
         local captureOK, captureError = pcall(CompleteLootCapture, capture, results)
         if not captureOK then
@@ -1999,11 +2004,12 @@ CompleteActiveLootWalk = function()
 end
 
 local function ServicePendingLootRequest()
+    if state.filterWalk then return end
     if not state.pendingLootReason then
         DebugLog("No queued loot request to service")
         return
     end
-    if IsPlayerCurrentlyMoving() then
+    if IsMovementBlockingLoot() then
         DebugLog("Queued loot request retained while player is moving; source="
             .. state.pendingLootReason)
         return
@@ -2043,6 +2049,7 @@ local function ServicePendingLootRequest()
 end
 
 local function RecoverTimedOutLootWalk()
+    if state.filterWalk then return end
     if not state.lootWalkActive or not state.lootWalkStartedAt
         or type(GetTime) ~= "function" then
         return
@@ -2064,16 +2071,16 @@ local function RecoverTimedOutLootWalk()
 end
 
 -- ===== Item filter =====
--- With the filter on, nothing is looted by LootAllCorpses. Instead the nearby
--- corpses are scanned silently, each item is checked against the filter, and
--- only the wanted items (and optionally money) are taken one at a time.
+-- With the filter on, LootAllCorpses is not used. Instead each nearby corpse is
+-- opened in turn, the wanted slots (and optionally money) are taken, and the
+-- window is closed again before moving on to the next corpse.
 AAL_Filter = {}
 
-local FILTER_STEP_DELAY = 0.30
-local FILTER_RETRY_DELAY = 0.15
-local FILTER_MAX_ATTEMPTS = 12
-local FILTER_COIN_TIMEOUT = 2.5
-local FILTER_QUEUE_TIMEOUT = 20
+local WALK_CORPSE_TIMEOUT = 1.5
+local WALK_TOTAL_TIMEOUT = 20
+local SKIP_RECENT_SECONDS = 20
+local SKIP_MONEY_SECONDS = 3
+local MOVE_POLL_BACKOFF = 0.25
 local FILTER_QUALITY_BY_COLOR = {
     ["9d9d9d"] = 0, ["ffffff"] = 1, ["1eff00"] = 2,
     ["0070dd"] = 3, ["a335ee"] = 4, ["ff8000"] = 5,
@@ -2097,8 +2104,7 @@ local function FilterPrint(message)
 end
 
 function AAL_Filter.HasAPI()
-    return C_Loot and type(C_Loot.ScanNearbyLoot) == "function"
-        and type(C_Loot.LootUnitItem) == "function"
+    return C_Loot and type(C_Loot.GetNearbyLootableUnits) == "function"
         and type(C_Loot.LootUnit) == "function"
 end
 
@@ -2136,13 +2142,14 @@ function AAL_Filter.FindEntry(entry)
 end
 
 function AAL_Filter.GetNameAndQuality(item)
-    local name, quality
+    local name, quality = item.name, item.quality
     local itemID = tonumber(item.itemID)
-    if itemID and type(GetItemInfo) == "function" then
+    if (not name or quality == nil) and itemID and type(GetItemInfo) == "function" then
         local ok, infoName, _, infoQuality =
             pcall(GetItemInfo, "item:" .. itemID .. ":0:0:0")
         if ok then
-            name, quality = infoName, infoQuality
+            name = name or infoName
+            if quality == nil then quality = infoQuality end
         end
     end
     if type(item.link) == "string" then
@@ -2193,117 +2200,187 @@ function AAL_Filter.CycleQuality()
     return AAL_Filter.GetQualityLabel()
 end
 
+local function ParseCoinText(text)
+    if type(text) ~= "string" then return 0 end
+    text = string.lower(text)
+    local total = 0
+    local function Part(word, multiplier)
+        if type(word) ~= "string" or word == "" then return end
+        local amount = string.match(text, "(%d+)%s*" .. string.lower(word))
+        if amount then total = total + tonumber(amount) * multiplier end
+    end
+    Part(GOLD, 10000)
+    Part(SILVER, 100)
+    Part(COPPER, 1)
+    return total
+end
+
+function AAL_Filter.SetLootFrameHidden(hidden)
+    if type(LootFrame) ~= "table" or type(LootFrame.SetAlpha) ~= "function" then
+        return
+    end
+    if hidden then
+        LootFrame:SetAlpha(0)
+        state.filterHidLootFrame = true
+    elseif state.filterHidLootFrame then
+        LootFrame:SetAlpha(1)
+        state.filterHidLootFrame = nil
+    end
+end
+
 function AAL_Filter.Reset()
-    state.filterQueueActive = false
-    state.filterQueue = nil
-    state.filterCurrent = nil
-    state.filterNextAt = 0
+    if state.filterWalk then
+        state.filterWalk = nil
+        state.lootWalkActive = false
+        state.activeCapture = nil
+        state.lootWalkStartedAt = nil
+    end
+    state.filterSkip = nil
+    AAL_Filter.SetLootFrameHidden(false)
 end
 
-function AAL_Filter.Advance(delay)
-    state.filterCurrent = nil
-    state.filterNextAt = FilterNow() + (delay or 0)
+-- Corpses in loot range. With the filter on, corpses already checked and found
+-- to hold nothing wanted are left out so they are not opened again and again.
+function AAL_Filter.ListLootableUnits(useSkip)
+    local guids = {}
+    if not (C_Loot and type(C_Loot.GetNearbyLootableUnits) == "function") then
+        return guids
+    end
+    local ok, units = pcall(C_Loot.GetNearbyLootableUnits)
+    if not ok or type(units) ~= "table" then return guids end
+    local now = FilterNow()
+    local skip = useSkip and state.filterSkip or nil
+    for _, unit in ipairs(units) do
+        local guid = type(unit) == "table" and unit.guid or nil
+        if type(guid) == "string" then
+            local skipUntil = skip and skip[guid]
+            if not (skipUntil and (skipUntil == true or skipUntil > now)) then
+                table.insert(guids, guid)
+            end
+        end
+    end
+    return guids
 end
 
-function AAL_Filter.Finish(reason)
-    AAL_Filter.Reset()
-    DebugLog("Filtered loot queue finished: " .. tostring(reason))
-    local ok, duration = pcall(GetAdaptiveLootSettleDuration)
-    if ok and tonumber(duration) then
-        state.lootSettleUntil = FilterNow() + duration
+local function FilterSignature()
+    local parts = { tostring(AutoAreaLootDB.lootMoneyFullCorpse),
+        tostring(AutoAreaLootDB.filterMinQuality) }
+    for _, entry in ipairs(AutoAreaLootDB.filterItems) do
+        table.insert(parts, tostring(entry.id) .. ":" .. tostring(entry.name))
+    end
+    return table.concat(parts, "|")
+end
+
+function AAL_Filter.StartWalk()
+    -- A changed filter means corpses skipped earlier may now hold wanted items.
+    local signature = FilterSignature()
+    if signature ~= state.filterSignature then
+        state.filterSignature = signature
+        state.filterSkip = nil
+    end
+    local skipCount = 0
+    for _ in pairs(state.filterSkip or {}) do skipCount = skipCount + 1 end
+    if skipCount > 300 then state.filterSkip = nil end
+
+    local guids = AAL_Filter.ListLootableUnits(true)
+    if table.getn(guids) == 0 then return false end
+    local latencyOK, _, latency = pcall(GetAdaptiveLootSettleDuration)
+    latency = latencyOK and tonumber(latency) or 150
+    state.filterWalk = {
+        queue = guids,
+        results = {},
+        startedAt = FilterNow(),
+        nextAt = 0,
+        -- A corpse that has not answered after a few round trips is out of reach.
+        corpseTimeout = math.max(0.8, math.min(2.5, latency / 1000 * 4)),
+    }
+    AAL_Filter.SetLootFrameHidden(true)
+    DebugLog("Filtered walk: " .. table.getn(guids) .. " corpse(s) queued")
+    return true
+end
+
+-- Takes one item from the corpse window that is open. ClassicAPI's call is
+-- used because the stock LootSlot does nothing in a window opened this way.
+local function TakeItem(guid, itemID)
+    if not (C_Loot and type(C_Loot.LootUnitItem) == "function") then return false end
+    local ok, accepted = pcall(C_Loot.LootUnitItem, guid, itemID)
+    DebugLog("LootUnitItem item=" .. tostring(itemID) .. " ok=" .. tostring(ok)
+        .. " accepted=" .. tostring(accepted))
+    return (ok and accepted) and true or false
+end
+
+function AAL_Filter.FinishWalk(reason)
+    local walk = state.filterWalk
+    if not walk then return end
+    state.filterWalk = nil
+    AAL_Filter.SetLootFrameHidden(false)
+    if walk.current and type(CloseLoot) == "function" then pcall(CloseLoot) end
+    DebugLog("Filtered walk finished: " .. tostring(reason) .. "; corpses with loot="
+        .. table.getn(walk.results))
+    CompleteActiveLootWalk(walk.results)
+    if walk.sawMoney then
+        -- The game offers no way to take only the money, so a corpse that
+        -- holds money gets one normal loot-all pass afterwards.
+        state.forceFullLoot = FilterNow()
+        QueuePendingLootRequest("moved")
+        DebugLog("Filtered walk: money seen; full loot pass queued")
+    else
+        -- Corpses already handled are remembered, so only a short pause is needed.
+        state.lootSettleUntil = FilterNow() + 0.15
     end
     ServicePendingLootRequest()
 end
 
-function AAL_Filter.Apply(results)
-    local filtered, queue = {}, {}
-    local wantMoney = AutoAreaLootDB.filterMoney and true or false
-    for _, corpse in ipairs(results or {}) do
-        local guid = type(corpse.guid) == "string" and corpse.guid or nil
-        if guid then
-            local keptItems = {}
-            for _, item in ipairs(corpse.items or {}) do
-                if AAL_Filter.ShouldLoot(item) then
-                    table.insert(keptItems, item)
-                    table.insert(queue, { guid = guid, itemID = tonumber(item.itemID) })
-                end
-            end
-            local coin = 0
-            if wantMoney then
-                coin = math.max(0, tonumber(corpse.coin) or 0)
-            end
-            if coin > 0 then
-                table.insert(queue, { guid = guid, coin = true })
-            end
-            if table.getn(keptItems) > 0 or coin > 0 then
-                table.insert(filtered, { guid = guid, coin = coin, items = keptItems })
-            end
-        end
+-- Asks for the next corpse, or finishes when none are left.
+local function SendNextCorpse(walk)
+    local guid = table.remove(walk.queue, 1)
+    if not guid then
+        AAL_Filter.FinishWalk("done")
+        return
     end
-    DebugLog("Item filter: " .. table.getn(queue) .. " step(s) queued from "
-        .. table.getn(results or {}) .. " corpse(s)")
-    if table.getn(queue) > 0 then
-        state.filterQueue = queue
-        state.filterQueueActive = true
-        state.filterCurrent = nil
-        state.filterNextAt = 0
-        state.filterStartedAt = FilterNow()
-    end
-    return filtered
+    walk.current = { guid = guid, sentAt = FilterNow() }
+    local ok = pcall(C_Loot.LootUnit, guid)
+    if not ok then walk.current = nil end
 end
 
 function AAL_Filter.Tick()
-    if not state.filterQueueActive then return end
+    local walk = state.filterWalk
+    if not walk then return end
     local now = FilterNow()
-    if now - (state.filterStartedAt or now) > FILTER_QUEUE_TIMEOUT then
-        AAL_Filter.Finish("timeout")
+    if now - walk.startedAt > WALK_TOTAL_TIMEOUT then
+        AAL_Filter.FinishWalk("timeout")
         return
     end
-    if now < (state.filterNextAt or 0) then return end
-
-    local step = state.filterCurrent
-    if not step then
-        step = table.remove(state.filterQueue, 1)
-        if not step then
-            AAL_Filter.Finish("done")
-            return
-        end
-        step.attempts = 0
-        state.filterCurrent = step
-    end
-
-    if step.coin then
-        if not step.sent then
-            step.sent = true
-            step.sentAt = now
-            local ok = pcall(C_Loot.LootUnit, step.guid)
-            DebugLog("Filter: opening corpse for money; ok=" .. tostring(ok))
-            if not ok then AAL_Filter.Advance(FILTER_STEP_DELAY) end
-        elseif now - step.sentAt > FILTER_COIN_TIMEOUT then
-            DebugLog("Filter: money step timed out")
-            AAL_Filter.Advance(FILTER_STEP_DELAY)
+    local current = walk.current
+    if current then
+        if now - current.sentAt > (walk.corpseTimeout or WALK_CORPSE_TIMEOUT) then
+            DebugLog("Filtered walk: corpse did not answer in time; moving on")
+            if type(CloseLoot) == "function" then pcall(CloseLoot) end
+            walk.current = nil
+            SendNextCorpse(walk)
         end
         return
     end
-
-    step.attempts = step.attempts + 1
-    local ok, result = pcall(C_Loot.LootUnitItem, step.guid, step.itemID)
-    if ok and result then
-        DebugLog("Filter: requested item " .. tostring(step.itemID))
-        AAL_Filter.Advance(FILTER_STEP_DELAY)
-    elseif step.attempts >= FILTER_MAX_ATTEMPTS then
-        DebugLog("Filter: gave up on item " .. tostring(step.itemID))
-        AAL_Filter.Advance(FILTER_STEP_DELAY)
-    else
-        state.filterNextAt = now + FILTER_RETRY_DELAY
-    end
+    if state.manualLootOpen then return end
+    SendNextCorpse(walk)
 end
 
--- Called from LOOT_OPENED while the queue runs. Only money steps use the
--- loot window; item steps are taken by LootUnitItem without it.
+-- The corpse we asked for is open: take what the filter wants, close the
+-- window and go straight on to the next corpse. The takes and the close travel
+-- to the server in order, so there is no need to wait for confirmations.
 function AAL_Filter.OnLootOpened()
-    local step = state.filterCurrent
-    if not step or not step.coin or not step.sent then return end
+    local walk = state.filterWalk
+    local current = walk and walk.current
+    if not current then
+        -- A window we did not ask for (the player's own): leave it alone.
+        state.manualLootOpen = true
+        return
+    end
+    if current.opened then return end
+    current.opened = true
+
+    local result = { guid = current.guid, coin = 0, items = {} }
+    local wanted, failed, hasMoney = 0, 0, false
     local count = type(GetNumLootItems) == "function" and GetNumLootItems() or 0
     for slot = 1, count do
         local isCoin
@@ -2312,17 +2389,98 @@ function AAL_Filter.OnLootOpened()
         elseif type(LootSlotIsItem) == "function" then
             isCoin = not LootSlotIsItem(slot)
         end
-        if isCoin then pcall(LootSlot, slot) end
+        local _, name, quantity, quality, locked = GetLootSlotInfo(slot)
+        DebugLog("Filtered walk slot " .. slot .. ": " .. (isCoin and "money" or "item")
+            .. " name=" .. tostring(name) .. " quality=" .. tostring(quality)
+            .. " locked=" .. tostring(locked))
+        if isCoin then
+            if AutoAreaLootDB.lootMoneyFullCorpse then
+                hasMoney = true
+                walk.sawMoney = true
+            end
+        elseif not locked then
+            local link = type(GetLootSlotLink) == "function" and GetLootSlotLink(slot) or nil
+            local itemID = link and tonumber(string.match(link, "item:(%d+)")) or nil
+            local item = {
+                itemID = itemID, link = link, name = name,
+                quality = quality, count = tonumber(quantity) or 1,
+            }
+            if itemID and AAL_Filter.ShouldLoot(item) then
+                if TakeItem(current.guid, itemID) then
+                    wanted = wanted + 1
+                    table.insert(result.items, item)
+                else
+                    failed = failed + 1
+                end
+            end
+        end
     end
     if type(CloseLoot) == "function" then pcall(CloseLoot) end
-    DebugLog("Filter: took money from open window")
-    AAL_Filter.Advance(FILTER_STEP_DELAY)
+
+    if table.getn(result.items) > 0 then
+        table.insert(walk.results, result)
+    end
+    state.filterSkip = state.filterSkip or {}
+    if failed > 0 then
+        state.filterSkip[current.guid] = nil   -- try this corpse again next time
+    elseif hasMoney then
+        state.filterSkip[current.guid] = FilterNow() + SKIP_MONEY_SECONDS
+    elseif wanted > 0 then
+        -- Everything wanted was taken. Look again much later in case a take
+        -- did not go through; a corpse with nothing wanted left is then skipped for good.
+        state.filterSkip[current.guid] = FilterNow() + SKIP_RECENT_SECONDS
+    else
+        state.filterSkip[current.guid] = true
+    end
+    DebugLog("Filtered walk: took " .. wanted .. " item(s), failed " .. failed
+        .. ", money=" .. tostring(hasMoney) .. " from "
+        .. string.sub(tostring(current.guid), -6))
+    walk.current = nil
+    SendNextCorpse(walk)
+end
+
+-- An error here must never leave a walk stuck or the loot window hidden.
+local function AbortWalkAfterError(where, err)
+    DebugLog("Filtered walk error in " .. where .. ": " .. tostring(err))
+    AAL_Filter.FinishWalk("error")
+end
+
+function AAL_Filter.SafeTick()
+    local ok, err = pcall(AAL_Filter.Tick)
+    if not ok then AbortWalkAfterError("Tick", err) end
+end
+
+function AAL_Filter.SafeOnLootOpened()
+    local ok, err = pcall(AAL_Filter.OnLootOpened)
+    if not ok then AbortWalkAfterError("OnLootOpened", err) end
+end
+
+function AAL_Filter.SafePoll()
+    local ok, err = pcall(AAL_Filter.PollWhileMoving)
+    if not ok then DebugLog("Moving poll error: " .. tostring(err)) end
+end
+
+-- While the player walks, check every so often for a corpse in range.
+function AAL_Filter.PollWhileMoving()
+    if not AutoAreaLootDB.enabled or not AutoAreaLootDB.lootWhileMoving then return end
+    if state.lootWalkActive or state.filterWalk or state.manualLootOpen
+        or state.lootRequestTimer then return end
+    local now = FilterNow()
+    if now < (state.movePollNext or 0) then return end
+    if not IsPlayerCurrentlyMoving() then return end
+    if IsPlayerInCombat() and not AutoAreaLootDB.lootInCombat then return end
+    if GetPlayerLootRestriction() or GetLootSettleDelay() > 0 then return end
+    if table.getn(AAL_Filter.ListLootableUnits(AutoAreaLootDB.filterEnabled)) == 0 then
+        return
+    end
+    state.movePollNext = now + MOVE_POLL_BACKOFF
+    DebugLog("Moving poll: lootable corpse in range; requesting loot")
+    ScheduleLootRequest(0, "moved")
 end
 
 function AAL_Filter.PrintList()
     local count = table.getn(AutoAreaLootDB.filterItems)
     FilterPrint("filter is " .. (AutoAreaLootDB.filterEnabled and "ON" or "OFF")
-        .. "; money " .. (AutoAreaLootDB.filterMoney and "looted" or "not looted")
         .. "; quality rule: " .. AAL_Filter.GetQualityLabel() .. ".")
     if count == 0 then
         FilterPrint("item list is empty. Add one with /aal add [shift-click an item]")
@@ -2386,10 +2544,10 @@ function AAL_Filter.HandleCommand(sub, rest)
         AAL_Filter.RefreshAll()
         return true
     elseif sub == "money" then
-        AutoAreaLootDB.filterMoney =
-            ParseOnOff(rest, AutoAreaLootDB.filterMoney)
-        FilterPrint("money looting with the filter: "
-            .. (AutoAreaLootDB.filterMoney and "ON" or "OFF") .. ".")
+        AutoAreaLootDB.lootMoneyFullCorpse =
+            ParseOnOff(rest, AutoAreaLootDB.lootMoneyFullCorpse)
+        FilterPrint("loot money (whole corpse): "
+            .. (AutoAreaLootDB.lootMoneyFullCorpse and "ON (a corpse with money is looted completely)" or "OFF") .. ".")
         AAL_Filter.RefreshAll()
         return true
     elseif sub == "quality" then
@@ -2405,6 +2563,13 @@ function AAL_Filter.HandleCommand(sub, rest)
         FilterPrint("quality rule: " .. AAL_Filter.GetQualityLabel() .. ".")
         AAL_Filter.RefreshAll()
         return true
+    elseif sub == "moving" then
+        AutoAreaLootDB.lootWhileMoving =
+            ParseOnOff(rest, AutoAreaLootDB.lootWhileMoving)
+        FilterPrint("loot while moving: "
+            .. (AutoAreaLootDB.lootWhileMoving and "ON" or "OFF") .. ".")
+        AAL_Filter.RefreshAll()
+        return true
     elseif sub == "help" then
         FilterPrint("filter commands:")
         DEFAULT_CHAT_FRAME:AddMessage("  /aal items  - open the filter menu (drag and drop, search)")
@@ -2414,7 +2579,8 @@ function AAL_Filter.HandleCommand(sub, rest)
         DEFAULT_CHAT_FRAME:AddMessage("  /aal list  - show the filter")
         DEFAULT_CHAT_FRAME:AddMessage("  /aal clear  - empty the item list")
         DEFAULT_CHAT_FRAME:AddMessage("  /aal quality green  - also loot every green or better item (off to disable)")
-        DEFAULT_CHAT_FRAME:AddMessage("  /aal money on|off  - loot money while filtering")
+        DEFAULT_CHAT_FRAME:AddMessage("  /aal money on|off  - loot corpses that hold money completely (items included)")
+        DEFAULT_CHAT_FRAME:AddMessage("  /aal moving on|off  - loot while walking, no need to stop")
         return true
     end
     return false
@@ -2707,7 +2873,6 @@ function AAL_Filter.RefreshMenu()
     menuFrame.emptyText:SetText(listCount == 0
         and "Empty. Drop an item on the slot above or add one from the results." or "")
     menuFrame.filterToggle:SetChecked(AutoAreaLootDB.filterEnabled)
-    menuFrame.moneyToggle:SetChecked(AutoAreaLootDB.filterMoney)
     if menuFrame.resultBar then menuFrame.resultBar.Update() end
     if menuFrame.listBar then menuFrame.listBar.Update() end
 end
@@ -2977,12 +3142,6 @@ local function CreateFilterMenu()
             AAL_Filter.RefreshAll()
         end)
     menuFrame.filterToggle:SetPoint("TOPLEFT", menuFrame, "TOPLEFT", 20, -426)
-    menuFrame.moneyToggle = CreateAALToggle(menuFrame, "Also loot money",
-        AutoAreaLootDB.filterMoney, function(checked)
-            AutoAreaLootDB.filterMoney = checked
-            AAL_Filter.RefreshAll()
-        end)
-    menuFrame.moneyToggle:SetPoint("TOPLEFT", menuFrame, "TOPLEFT", 150, -426)
 
     menuFrame:SetScript("OnShow", function()
         AAL_Filter.RunSearch()
@@ -3102,7 +3261,8 @@ end
 local function RefreshConfigPanel()
     if not configFrame or not state.initialized then return end
     configFrame.filterCheck:SetChecked(AutoAreaLootDB.filterEnabled)
-    configFrame.filterMoneyCheck:SetChecked(AutoAreaLootDB.filterMoney)
+    configFrame.moneyCheck:SetChecked(AutoAreaLootDB.lootMoneyFullCorpse)
+    configFrame.movingCheck:SetChecked(AutoAreaLootDB.lootWhileMoving)
     configFrame.qualityButton.label:SetText("Quality: " .. AAL_Filter.GetQualityLabel())
     configFrame.enabledCheck:SetChecked(AutoAreaLootDB.enabled)
     configFrame.deathCheck:SetChecked(AutoAreaLootDB.lootOnDeath)
@@ -3116,7 +3276,7 @@ local function CreateConfigPanel()
 
     configFrame = CreateFrame("Frame", "AutoAreaLootConfigFrame", UIParent)
     configFrame:SetWidth(260)
-    configFrame:SetHeight(296)
+    configFrame:SetHeight(322)
     configFrame:SetPoint("CENTER", UIParent, "CENTER", 0, 80)
     configFrame:SetFrameStrata("DIALOG")
     configFrame:SetToplevel(true)
@@ -3173,11 +3333,13 @@ local function CreateConfigPanel()
 
     configFrame.filterCheck = CreateCheckButton(
         configFrame, "Only loot items on my list", -164, "filterEnabled")
-    configFrame.filterMoneyCheck = CreateCheckButton(
-        configFrame, "Also loot money", -188, "filterMoney")
+    configFrame.moneyCheck = CreateCheckButton(
+        configFrame, "Loot money (whole corpse)", -188, "lootMoneyFullCorpse")
+    configFrame.movingCheck = CreateCheckButton(
+        configFrame, "Loot while moving", -212, "lootWhileMoving")
 
     local qualityButton = CreateAALButton(configFrame, 180, 18, "Quality: off")
-    qualityButton:SetPoint("TOP", configFrame, "TOP", 0, -212)
+    qualityButton:SetPoint("TOP", configFrame, "TOP", 0, -238)
     ApplyLootFont(qualityButton.label, 10)
     qualityButton:SetScript("OnClick", function()
         AAL_Filter.CycleQuality()
@@ -3186,7 +3348,7 @@ local function CreateConfigPanel()
     configFrame.qualityButton = qualityButton
 
     local menuButton = CreateAALButton(configFrame, 180, 18, "Edit Filter List...")
-    menuButton:SetPoint("TOP", configFrame, "TOP", 0, -238)
+    menuButton:SetPoint("TOP", configFrame, "TOP", 0, -264)
     ApplyLootFont(menuButton.label, 10)
     menuButton:SetScript("OnClick", function() AAL_Filter.ShowMenu() end)
 
@@ -3433,8 +3595,8 @@ eventFrame:SetScript("OnEvent", function()
     end
 
     if event == "LOOT_OPENED" then
-        if state.filterQueueActive then
-            AAL_Filter.OnLootOpened()
+        if state.filterWalk then
+            AAL_Filter.SafeOnLootOpened()
             return
         end
         if state.lootWalkActive then
@@ -3450,6 +3612,11 @@ eventFrame:SetScript("OnEvent", function()
             state.manualLootOpen = true
             DebugLog("Manual loot window marked open")
         end
+        return
+    end
+
+    if event == "LOOT_CLOSED" and state.filterWalk then
+        state.manualLootOpen = false
         return
     end
 
@@ -3561,7 +3728,13 @@ end)
 eventFrame:SetScript("OnUpdate", function()
     if not state.initialized then return end
 
-    if state.filterQueueActive then AAL_Filter.Tick() end
+    if state.filterWalk then AAL_Filter.SafeTick() end
+
+    state.movePollElapsed = (state.movePollElapsed or 0) + arg1
+    if state.movePollElapsed >= 0.10 then
+        state.movePollElapsed = 0
+        AAL_Filter.SafePoll()
+    end
 
     state.playerStateSampleElapsed = state.playerStateSampleElapsed + arg1
     if state.playerStateSampleElapsed >= PLAYER_STATE_SAMPLE_INTERVAL then
